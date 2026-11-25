@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""Offline skill finder — BM25 search over every SKILL.md in a skills tree.
+
+Built because with ~270 skills the only way to find the right one was to read
+the index and hope, or to guess a name. That is a search problem, so it gets a
+search tool. No API, no embeddings, no network: tokenise the corpus, build an
+inverted index, cache it, and rank with BM25.
+
+  skill-find "<query>"        top 5 skills, score and why
+  skill-find -n 10 "<query>"  more of them
+  skill-find --json "<query>" machine-readable
+  skill-find --rebuild "<q>"  force index rebuild
+  skill-find --stats          corpus + index state
+
+Skills root: $SKILL_FIND_DIR, else ~/.centurion/skills
+Index cache: $XDG_CACHE_HOME/skill-find/index.json (default ~/.cache/skill-find)
+Rebuilt automatically when any SKILL.md is added, removed, or newer than the
+index (mtime_ns + size fingerprint per file).
+
+Scope: every SKILL.md under the skills root, at any depth, excluding
+dot-directories — archived skills in .archive/ are deliberately not searchable,
+because offering a skill that cannot be loaded is worse than no result.
+
+No network, no API, no embeddings, no dependencies beyond the standard library.
+
+Field weights: name x4, tags x3, description x2, body x1. BM25 (k1=1.2, b=0.4)
+over the field-weighted term frequencies, so a skill whose *name* is the query
+beats one that merely mentions it in paragraph nine.
+"""
+import json
+import math
+import os
+import re
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SKILLS_DIR = os.environ.get("SKILL_FIND_DIR") or os.path.join(HOME, ".centurion", "skills")
+_CACHE = os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache")
+STATE_DIR = os.path.join(_CACHE, "skill-find")
+INDEX_PATH = os.path.join(STATE_DIR, "index.json")
+INDEX_VERSION = 3
+
+W_NAME, W_TAG, W_DESC, W_BODY = 4.0, 3.0, 2.0, 1.0
+# body is long; cap the tokens we keep per body so one huge SKILL.md does not
+# swamp the corpus statistics. Matches the injected-head behaviour of the loader.
+BODY_TOKEN_CAP = 1200
+
+STOP = set("""a an and are as at be been being but by can could did do does doing
+for from had has have having how i if in into is it its itself just like may
+might must my no nor not now of on once only or other our out over same should
+so some such than that the their them then there these they this those through
+to too under until up very was we were what when where which while who whom why
+will with would you your yours also any all each more most much many""" .split())
+
+BM25_K1, BM25_B = 1.2, 0.4
+
+TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def tokenize(text, stem=True):
+    out = []
+    for w in TOKEN_RE.findall((text or "").lower()):
+        if len(w) < 2 or w in STOP:
+            continue
+        if len(w) > 2 and w.isdigit():
+            continue
+        out.append(stem_word(w) if stem else w)
+    return out
+
+
+def stem_word(w):
+    """Crude but stable suffix stripping — enough to make 'skills'/'skill' and
+    'loading'/'load' collide. Not a Porter stemmer; consistency matters more
+    than linguistic purity here."""
+    if len(w) > 4 and w.endswith("ies"):
+        return w[:-3] + "y"
+    if w.endswith("sses"):
+        return w[:-2]
+    for suf in ("ings", "ing", "edly", "ed", "es", "s"):
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            return w[: -len(suf)]
+    return w
+
+
+def parse_frontmatter(text):
+    """Return (meta dict-ish, body). Deliberately tolerant — hand-written YAML
+    in 270 files will contain something that a strict parser chokes on."""
+    name = desc = ""
+    tags = []
+    body = text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            fm = text[3:end]
+            body = text[end + 4:]
+            for line in fm.splitlines():
+                s = line.strip()
+                low = s.lower()
+                if low.startswith("name:"):
+                    name = s.split(":", 1)[1].strip().strip('"\'')
+                elif low.startswith("description:"):
+                    desc = s.split(":", 1)[1].strip().strip('"\'')
+                elif re.match(r"^\s*tags:\s*\[", line):
+                    inner = line.split("[", 1)[1].rsplit("]", 1)[0]
+                    tags += [t.strip().strip('"\'') for t in inner.split(",") if t.strip()]
+    return name, desc, tags, body
+
+
+def find_skill_files(root):
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        if "SKILL.md" in filenames:
+            found.append(os.path.join(dirpath, "SKILL.md"))
+    return sorted(found)
+
+
+def fingerprint(paths):
+    fp = {}
+    for p in paths:
+        try:
+            st = os.stat(p)
+            fp[p] = [st.st_mtime_ns, st.st_size]
+        except OSError:
+            continue
+    return fp
+
+
+def build_index(paths):
+    docs = []
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        name, desc, tags, body = parse_frontmatter(text)
+        fallback = os.path.basename(os.path.dirname(path))
+        skill = name or fallback
+
+        tf = {}
+        where = {}
+
+        def merge(tokens, weight, field, cap=None):
+            """Saturating add: repetition inside one field gives diminishing
+            returns (1, 1.69, 2.10, ...), so four mentions in a body paragraph
+            can never masquerade as a hit on the skill's name."""
+            if cap:
+                tokens = tokens[:cap]
+            counts = {}
+            for t in tokens:
+                counts[t] = counts.get(t, 0) + 1
+            for t, c in counts.items():
+                tf[t] = tf.get(t, 0.0) + weight * (1.0 + math.log(c))
+                where.setdefault(t, [])
+                if field not in where[t]:
+                    where[t].append(field)
+
+        merge(tokenize(skill), W_NAME, "name")
+        merge(tokenize(skill.replace("-", " ").replace("_", " ")), W_NAME, "name")
+        merge(tokenize(" ".join(tags)), W_TAG, "tags")
+        merge(tokenize(desc), W_DESC, "desc")
+        merge(tokenize(fallback.replace("-", " ")), W_DESC, "name")
+        merge(tokenize(body), W_BODY, "body", BODY_TOKEN_CAP)
+
+        dl = sum(tf.values()) or 1.0
+        docs.append({
+            "skill": skill,
+            "path": path,
+            "rel": os.path.relpath(path, SKILLS_DIR),
+            "desc": desc,
+            "dl": dl,
+            "tf": {k: round(v, 4) for k, v in tf.items()},
+            "where": where,
+        })
+
+    n = len(docs)
+    df = {}
+    for d in docs:
+        for t in d["tf"]:
+            df[t] = df.get(t, 0) + 1
+    avgdl = (sum(d["dl"] for d in docs) / n) if n else 1.0
+
+    return {
+        "version": INDEX_VERSION,
+        "built": time.time(),
+        "fingerprint": fingerprint(paths),
+        "n": n,
+        "avgdl": avgdl,
+        "df": df,
+        "docs": docs,
+    }
+
+
+def index_is_stale(index, paths):
+    if not index or index.get("version") != INDEX_VERSION:
+        return True, "version/absent"
+    old = index.get("fingerprint") or {}
+    new = fingerprint(paths)
+    if set(old) != set(new):
+        return True, "file set changed"
+    for p, sig in new.items():
+        if old.get(p) != sig:
+            return True, "modified: %s" % os.path.basename(os.path.dirname(p))
+    return False, "fresh"
+
+
+def load_index(force=False, quiet=True):
+    os.makedirs(STATE_DIR, exist_ok=True)
+    paths = find_skill_files(SKILLS_DIR)
+    index = None
+    if not force and os.path.exists(INDEX_PATH):
+        try:
+            with open(INDEX_PATH, "r", encoding="utf-8") as fh:
+                index = json.load(fh)
+        except (OSError, ValueError):
+            index = None
+    stale, reason = index_is_stale(index, paths) if not force else (True, "forced")
+    if stale:
+        index = build_index(paths)
+        try:
+            tmp = INDEX_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(index, fh)
+            os.replace(tmp, INDEX_PATH)
+        except OSError as exc:
+            if not quiet:
+                print("warn: could not write index: %s" % exc, file=sys.stderr)
+        if not quiet:
+            print("index rebuilt (%s): %d skills" % (reason, index["n"]), file=sys.stderr)
+    return index
+
+
+def search(index, query, limit=5):
+    q_tokens = tokenize(query)
+    if not q_tokens:
+        return []
+    # de-duplicate, preserve order, keep counts low: repeated query words should
+    # not double-count, they are one intent.
+    seen, q = set(), []
+    for t in q_tokens:
+        if t not in seen:
+            seen.add(t)
+            q.append(t)
+
+    n = index["n"] or 1
+    avgdl = index["avgdl"] or 1.0
+    df = index["df"]
+    results = []
+    for d in index["docs"]:
+        score = 0.0
+        hits = []
+        for t in q:
+            f = d["tf"].get(t)
+            if not f:
+                continue
+            idf = math.log(1.0 + (n - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5))
+            denom = f + BM25_K1 * (1.0 - BM25_B + BM25_B * d["dl"] / avgdl)
+            contrib = idf * (f * (BM25_K1 + 1.0)) / denom
+            score += contrib
+            hits.append((contrib, t, f))
+        if not score:
+            continue
+        # name evidence dominates the "why" — report the strongest terms and
+        # which field carried them (tf >= 4 means it was in the skill name).
+        hits.sort(reverse=True)
+        coverage = len(hits) / float(len(q))
+        score *= (0.75 + 0.25 * coverage)  # reward covering the whole query
+        terms = [h[1] for h in hits[:3]]
+        # field provenance comes from the index, never from guessing at weights
+        best = hits[0][1]
+        fields = set()
+        for contrib, t, f in hits:
+            fields.update(d.get("where", {}).get(t, ["body"]))
+        # lead with where the *strongest* term lives, then the rest
+        order = ["name", "tags", "desc", "body"]
+        lead = [f for f in order if f in d.get("where", {}).get(best, [])]
+        rest = [f for f in order if f in fields and f not in lead]
+        ordered_fields = lead + rest
+        results.append({
+            "skill": d["skill"],
+            "rel": d["rel"],
+            "path": d["path"],
+            "score": round(score, 2),
+            "why": "%s: %s (%d/%d terms)" % (
+                "+".join(ordered_fields), ", ".join(terms), len(hits), len(q)),
+            "desc": (d["desc"] or "")[:160],
+        })
+    results.sort(key=lambda r: (-r["score"], r["skill"]))
+    return results[:limit]
+
+
+def one_line(desc, width=110):
+    if not desc:
+        return ""
+    d = re.sub(r"\s+", " ", desc).strip()
+    return d if len(d) <= width else d[: width - 1] + "\u2026"
+
+
+def main(argv):
+    args = list(argv[1:])
+    as_json = False
+    limit = 5
+    force = False
+    stats = False
+    query_parts = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        if a == "--json":
+            as_json = True
+        elif a in ("--rebuild", "-r"):
+            force = True
+        elif a == "--stats":
+            stats = True
+        elif a in ("-n", "--limit"):
+            i += 1
+            try:
+                limit = max(1, int(args[i]))
+            except (IndexError, ValueError):
+                print("error: -n needs a number", file=sys.stderr)
+                return 2
+        elif a.startswith("-n") and len(a) > 2:
+            limit = max(1, int(a[2:]))
+        else:
+            query_parts.append(a)
+        i += 1
+
+    index = load_index(force=force)
+
+    if stats:
+        age = time.time() - index.get("built", time.time())
+        print("skills indexed : %d" % index["n"])
+        print("unique terms   : %d" % len(index["df"]))
+        print("avg weighted dl: %.0f" % index["avgdl"])
+        print("index          : %s (%.0fs old, %.1f KB)" % (
+            INDEX_PATH, age, os.path.getsize(INDEX_PATH) / 1024.0))
+        return 0
+
+    query = " ".join(query_parts).strip()
+    if not query:
+        print("usage: skill-find [-n N] [--json] [--rebuild] [--stats] <query>",
+              file=sys.stderr)
+        return 2
+
+    hits = search(index, query, limit)
+    if as_json:
+        print(json.dumps({"query": query, "hits": hits}, indent=2))
+        return 0 if hits else 1
+    if not hits:
+        print("no skill matches %r" % query)
+        return 1
+    width = max(len(h["skill"]) for h in hits) + 2
+    for rank, h in enumerate(hits, 1):
+        print("%d. %-*s %7.2f  %s" % (rank, width, h["skill"], h["score"], h["why"]))
+        line = one_line(h["desc"])
+        if line:
+            print("   %-*s         %s" % (width, "", line))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
